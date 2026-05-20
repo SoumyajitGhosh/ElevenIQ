@@ -1,10 +1,14 @@
 from langchain_core.tools import tool
-from data.football_data import FORMATIONS, PLAYERS, ROLES
+from langchain_community.tools import DuckDuckGoSearchRun
+
+from agent.scrapers import fetch_formation_wiki, fetch_player_fbref, fetch_role_wiki
+
+_ddg_search = DuckDuckGoSearchRun()
 
 # ── Tool 1: Player Stats ──────────────────────────────────────────────────────
 
 @tool
-def get_player_stats(player_name: str) -> dict:
+async def get_player_stats(player_name: str) -> dict:
     """Get detailed statistics and a scouting report for a football player.
 
     Use when the user asks about:
@@ -22,34 +26,17 @@ def get_player_stats(player_name: str) -> dict:
     """
     key = player_name.lower().strip()
 
-    # Partial name matching — "haaland" hits "erling haaland"
-    matched_data = None
-    for player_key, player_data in PLAYERS.items():
-        if key in player_key or any(key in part for part in player_key.split()):
-            matched_data = player_data
-            break
-
-    if matched_data is None:
-        available = [p["name"] for p in PLAYERS.values()]
-        return {
-            "error": f"No data found for '{player_name}'.",
-            "available_players": available,
-        }
-
     return {
-        "player": matched_data["name"],
-        "club": matched_data["club"],
-        "position": matched_data["position"],
-        "stats": matched_data["stats"],
-        "roles": matched_data["roles"],
-        "summary": matched_data["summary"],
+        "stats": await fetch_player_fbref(player_name),
+        "fallback": True,
+        "player_name": player_name,
     }
 
 
 # ── Tool 2: Formation Comparison ──────────────────────────────────────────────
 
 @tool
-def compare_formations(formation_a: str, formation_b: str) -> dict:
+async def compare_formations(formation_a: str, formation_b: str) -> dict:
     """Compare two tactical formations head-to-head like a tactical analyst.
 
     Use when the user asks about:
@@ -66,23 +53,9 @@ def compare_formations(formation_a: str, formation_b: str) -> dict:
         Side-by-side tactical breakdown including strengths, weaknesses,
         best use case, and famous clubs that used each system.
     """
-    fa = FORMATIONS.get(formation_a.strip())
-    fb = FORMATIONS.get(formation_b.strip())
-
-    errors = []
-    if fa is None:
-        errors.append(f"Formation '{formation_a}' not found.")
-    if fb is None:
-        errors.append(f"Formation '{formation_b}' not found.")
-    if errors:
-        return {
-            "error": " ".join(errors),
-            "available_formations": list(FORMATIONS.keys()),
-        }
-
     return {
-        "formation_a": fa,
-        "formation_b": fb,
+        "formation_a": await fetch_formation_wiki(formation_a),
+        "formation_b": await fetch_formation_wiki(formation_b),
         "summary": (
             f"Comparing {formation_a} vs {formation_b}: "
             f"'{fa['best_for']}' — versus — '{fb['best_for']}'"
@@ -93,7 +66,7 @@ def compare_formations(formation_a: str, formation_b: str) -> dict:
 # ── Tool 3: Role Scouting ─────────────────────────────────────────────────────
 
 @tool
-def scout_role(role_name: str) -> dict:
+async def scout_role(role_name: str) -> dict:
     """Get a detailed scouting profile for a tactical football role.
 
     Use when the user asks about:
@@ -113,19 +86,34 @@ def scout_role(role_name: str) -> dict:
     """
     key = role_name.lower().strip()
 
-    role_data = ROLES.get(key)
+    return {
+        "stats": await fetch_role_wiki(role_name),
+        "fallback": True,
+    }
 
-    # Partial match fallback — "box-to-box" hits "box-to-box midfielder"
-    if role_data is None:
-        for role_key, data in ROLES.items():
-            if key in role_key:
-                role_data = data
-                break
+# ── Tool 4: Web Search Fallback (DuckDuckGo) ─────────────────────────────────
 
-    if role_data is None:
-        return {
-            "error": f"Role '{role_name}' not found.",
-            "available_roles": list(ROLES.keys()),
-        }
+@tool
+async def search_football_web(query: str) -> str:
+    """Search the web for football information not covered by the other tools.
 
-    return role_data
+    Use this tool when:
+    - get_player_stats returns fallback=True (player not on FBref)
+    - compare_formations returns fallback=True (formation not on Wikipedia)
+    - scout_role returns fallback=True (role not found)
+    - The user asks about recent transfers, injuries, or match results
+    - The user asks about managers, clubs, tournaments, or history
+    - You need to cross-check or enrich data from another tool
+
+    This is your general-purpose fallback. Always try the specific tools
+    (get_player_stats, compare_formations, scout_role) before using this.
+
+    Args:
+        query: A focused football search query — be specific.
+               Good: "Lamine Yamal 2025 stats goals assists La Liga"
+               Bad:  "football player stats" (too vague)
+
+    Returns:
+        Raw web search results. Synthesise them into a clear analyst answer.
+    """
+    return _ddg_search.run(query)

@@ -23,7 +23,7 @@ from langgraph.prebuilt import ToolNode
 
 from agent.nodes import build_agent_node, should_continue
 from agent.state import AgentState
-from agent.tools import compare_formations, get_player_stats, scout_role
+from agent.tools import compare_formations, get_player_stats, scout_role, search_football_web
 from config import get_llm
 
 
@@ -36,7 +36,7 @@ def build_football_agent():
     """
     # ── 1. Tools ─────────────────────────────────────────────────────────────
     # All tools the LLM can choose from.
-    tools = [get_player_stats, compare_formations, scout_role]
+    tools = [get_player_stats, compare_formations, scout_role, search_football_web]
 
     # ── 2. LLM with tools bound ───────────────────────────────────────────────
     # bind_tools() tells the LLM the tool names, descriptions, and param schemas.
