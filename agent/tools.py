@@ -1,119 +1,166 @@
+"""
+Each tool calls a specific data source — no LLM search involved.
+
+  get_player_stats  → SofaScore (stats) + Understat (xG)
+  get_player_xg     → Understat only (deeper xG breakdown)
+  compare_formations→ FootyStats (formation win/goal stats per league)
+  scout_role        → Understat league players filtered by position
+"""
+
 from langchain_core.tools import tool
-from langchain_community.tools import DuckDuckGoSearchRun
 
-from agent.scrapers import fetch_formation_wiki, fetch_player_fbref, fetch_role_wiki
+from agent.scrapers import (
+    fetch_footystats_formation,
+    fetch_sofascore_player,
+    fetch_understat_league_players,
+    fetch_understat_player_xg,
+    fetch_fbref_player,
+)
 
-_ddg_search = DuckDuckGoSearchRun()
 
-# ── Tool 1: Player Stats ──────────────────────────────────────────────────────
+# ── Tool 1: Player Stats (SofaScore primary, Understat xG enrichment) ─────────
 
 @tool
 async def get_player_stats(player_name: str) -> dict:
-    """Get detailed statistics and a scouting report for a football player.
+    """Get live stats for a football player from SofaScore and Understat.
 
-    Use when the user asks about:
-    - A specific player's performance numbers or ratings
-    - Scouting a particular player
-    - What position or tactical roles a player can fill
-    - Comparing a player's key metrics
+    Use for:
+    - Goals, assists, rating, minutes for any player this season
+    - xG and xA (expected goals and assists)
+    - Club, position, nationality
 
     Args:
-        player_name: Full or partial player name.
-                     Examples: "Haaland", "De Bruyne", "Bellingham"
-
-    Returns:
-        Player stats, tactical roles, club, and an analyst summary.
+        player_name: Full or partial name. Examples: "Haaland", "Pedri", "Bellingham"
     """
-    key = player_name.lower().strip()
+    sofa  = await fetch_sofascore_player(player_name)
+    xg    = await fetch_understat_player_xg(player_name)
 
+    # Merge: SofaScore for match stats, Understat for xG layer
     return {
-        "stats": await fetch_player_fbref(player_name),
-        "fallback": True,
-        "player_name": player_name,
+        "player":      sofa.get("player", player_name),
+        "team":        sofa.get("team", ""),
+        "position":    sofa.get("position", ""),
+        "nationality": sofa.get("nationality", ""),
+        "match_stats": sofa.get("stats", {}),
+        "xg_stats":    {k: v for k, v in xg.items()
+                        if k in ("xG", "xA", "npxG", "shots", "key_passes")},
+        "sources":     ["SofaScore", "Understat"],
     }
 
 
-# ── Tool 2: Formation Comparison ──────────────────────────────────────────────
+# ── Tool 2: xG Breakdown (Understat deep-dive) ────────────────────────────────
 
 @tool
-async def compare_formations(formation_a: str, formation_b: str) -> dict:
-    """Compare two tactical formations head-to-head like a tactical analyst.
+async def get_player_xg(player_name: str) -> dict:
+    """Get detailed expected goals (xG) and xA breakdown for a player from Understat.
 
-    Use when the user asks about:
-    - Differences or matchups between two formations
-    - Which formation suits a particular style of play
-    - How a system's strengths and weaknesses stack up
-    - Questions like "4-3-3 vs 4-2-3-1 — what's the difference?"
+    Use when the user wants a deeper look at shot quality and chance creation —
+    not just raw goals/assists but xG overperformance, npxG, etc.
 
     Args:
-        formation_a: First formation string.  Examples: "4-3-3", "4-2-3-1"
-        formation_b: Second formation string. Examples: "3-4-3", "4-4-2"
-
-    Returns:
-        Side-by-side tactical breakdown including strengths, weaknesses,
-        best use case, and famous clubs that used each system.
+        player_name: Player name. Examples: "Haaland", "Mbappe", "Salah"
     """
+    return await fetch_understat_player_xg(player_name)
+
+
+# ── Tool 3: Formation Comparison (FootyStats) ─────────────────────────────────
+
+@tool
+async def compare_formations(formation_a: str, formation_b: str, league: str = "epl") -> dict:
+    """Compare two formations using real league stats from FootyStats.
+
+    Returns win rate, goals scored/conceded per game for teams
+    using each formation in the specified league.
+
+    Args:
+        formation_a: e.g. "4-3-3", "3-4-3"
+        formation_b: e.g. "4-2-3-1", "4-4-2"
+        league:      League to pull stats from. Options: "epl", "la liga",
+                     "bundesliga", "serie a", "ligue 1". Default: "epl"
+    """
+    fa, fb = await fetch_footystats_formation(formation_a, league), \
+             await fetch_footystats_formation(formation_b, league)
+    return {"formation_a": fa, "formation_b": fb}
+
+
+# ── Tool 4: Role Scouting (Understat league players by position) ──────────────
+
+# Maps tactical role names to Understat position codes
+# Understat positions: FW, AM, MF, DM, DF, GK
+_ROLE_TO_POSITION: dict[str, str] = {
+    # Forwards
+    "target man":        "FW",
+    "false 9":           "FW",
+    "false nine":        "FW",
+    "complete forward":  "FW",
+    "poacher":           "FW",
+    "pressing forward":  "FW",
+    # Attacking mids / wide
+    "trequartista":      "AM",
+    "shadow striker":    "AM",
+    "number 10":         "AM",
+    "inverted winger":   "AM",
+    "winger":            "AM",
+    "enganche":          "AM",
+    # Central mids
+    "box-to-box midfielder": "MF",
+    "mezzala":           "MF",
+    "carrilero":         "MF",
+    # Defensive mids
+    "regista":           "DM",
+    "deep-lying playmaker": "DM",
+    "segundo volante":   "DM",
+    "anchor":            "DM",
+    # Defenders
+    "ball-playing defender": "DF",
+    "libero":            "DF",
+    "sweeper":           "DF",
+    "inverted full-back": "DF",
+}
+
+
+@tool
+async def scout_role(
+    role_name: str,
+    league: str = "EPL",
+    season: str = "2024",
+    top_n: int = 8,
+) -> dict:
+    """Find the top-performing players for a given tactical role using Understat data.
+
+    Instead of a definition, this returns REAL players who best exemplify
+    the role — ranked by xG (for attacking roles) or xA (for creative roles).
+
+    Args:
+        role_name: Tactical role. Examples: "regista", "false 9", "inverted winger",
+                   "target man", "trequartista", "box-to-box midfielder"
+        league:    Understat league code. Options: EPL, La_liga, Bundesliga,
+                   Serie_A, Ligue_1. Default: "EPL"
+        season:    Season start year. Default: "2024" (= 2024/25 season)
+        top_n:     How many players to return. Default: 8
+    """
+    position_code = _ROLE_TO_POSITION.get(role_name.lower().strip())
+    if not position_code:
+        known = list(_ROLE_TO_POSITION.keys())
+        return {
+            "error": f"Role '{role_name}' not mapped to a position.",
+            "known_roles": known,
+        }
+
+    all_players = await fetch_understat_league_players(league, season)
+
+    # Filter by position and sort by xG (best proxy for role impact)
+    filtered = [
+        p for p in all_players
+        if p.get("position", "").upper() == position_code and p.get("xG", 0) > 0
+    ]
+    top = sorted(filtered, key=lambda p: p.get("xG", 0), reverse=True)[:top_n]
+
     return {
-        "formation_a": await fetch_formation_wiki(formation_a),
-        "formation_b": await fetch_formation_wiki(formation_b),
-        "summary": (
-            f"Comparing {formation_a} vs {formation_b}: "
-            f"'{fa['best_for']}' — versus — '{fb['best_for']}'"
-        ),
+        "role":          role_name,
+        "mapped_to":     position_code,
+        "league":        league,
+        "season":        season,
+        "top_players":   top,
+        "source":        "Understat",
     }
-
-
-# ── Tool 3: Role Scouting ─────────────────────────────────────────────────────
-
-@tool
-async def scout_role(role_name: str) -> dict:
-    """Get a detailed scouting profile for a tactical football role.
-
-    Use when the user asks about:
-    - What attributes or qualities a specific role demands
-    - How a role functions within a team's tactical system
-    - What kind of player profile fits a role
-    - Questions like "what makes a good target man?" or "explain inverted winger"
-
-    Args:
-        role_name: Name of the tactical role (case-insensitive).
-                   Examples: "target man", "deep-lying playmaker",
-                             "inverted winger", "box-to-box midfielder",
-                             "ball-playing defender"
-
-    Returns:
-        Key attributes, tactical function, best system fit, and real player examples.
-    """
-    key = role_name.lower().strip()
-
-    return {
-        "stats": await fetch_role_wiki(role_name),
-        "fallback": True,
-    }
-
-# ── Tool 4: Web Search Fallback (DuckDuckGo) ─────────────────────────────────
-
-@tool
-async def search_football_web(query: str) -> str:
-    """Search the web for football information not covered by the other tools.
-
-    Use this tool when:
-    - get_player_stats returns fallback=True (player not on FBref)
-    - compare_formations returns fallback=True (formation not on Wikipedia)
-    - scout_role returns fallback=True (role not found)
-    - The user asks about recent transfers, injuries, or match results
-    - The user asks about managers, clubs, tournaments, or history
-    - You need to cross-check or enrich data from another tool
-
-    This is your general-purpose fallback. Always try the specific tools
-    (get_player_stats, compare_formations, scout_role) before using this.
-
-    Args:
-        query: A focused football search query — be specific.
-               Good: "Lamine Yamal 2025 stats goals assists La Liga"
-               Bad:  "football player stats" (too vague)
-
-    Returns:
-        Raw web search results. Synthesise them into a clear analyst answer.
-    """
-    return _ddg_search.run(query)

@@ -10,7 +10,7 @@ async def chat() -> None:
 
     print("\n" + "=" * 56)
     print("  ⚽  ElevenIQ: Football Analysis Agent")
-    print("  Powered by LangGraph + G", get_llm().model_name)
+    print("  Powered by LangGraph +", get_llm().model_name)
     print("=" * 56)
     print("Ask me about players, formations, or tactical roles.")
     print("The agent will use tools to ground every answer in data.")
